@@ -5,7 +5,6 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"io"
 	"net/http"
 	"sort"
 	"strconv"
@@ -58,20 +57,15 @@ type input struct {
 	Values []*int `json:"values"`
 }
 
-type output struct {
-	Values   []*int `json:"values"`
-	Counters []int  `json:"counters"`
-}
-
 type response struct {
-	Status string            `json:"status"`
-	Data   map[string]output `json:"data"`
+	Status string                 `json:"status"`
+	Data   map[string]*storeEntry `json:"data"`
 }
 
 type storeEntry struct {
-	values   []int
-	counters []int
-	cnt      int
+	Values   []int `json:"values"`
+	Counters []int `json:"counters"`
+	Cnt      int   `json:"-"`
 }
 
 type mStore struct {
@@ -114,22 +108,22 @@ func (app *application) insertHandler(w http.ResponseWriter, req *http.Request) 
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	io.WriteString(w, fmt.Sprintf(`{"status": "%s", "message": "%s"}`, status, message))
+	fmt.Fprintf(w, `{"status": "%s", "message": "%s"}`, status, message)
 
 }
 
 func (app *application) groupHandler(w http.ResponseWriter, req *http.Request) {
 
 	var (
-		group string
-		agg   int
-		err   error
+		group   string
+		agg     int
+		err     error
+		message string
 	)
 
 	param := req.FormValue("aggregation")
 	slugs := strings.Split(req.URL.Path, "/")
 	valid := false
-	message := "invalid request"
 
 	if req.Method == http.MethodGet && len(slugs) == 3 {
 		agg, err = strconv.Atoi(param)
@@ -151,34 +145,22 @@ func (app *application) groupHandler(w http.ResponseWriter, req *http.Request) {
 		defer app.store.RUnlock()
 		r := response{
 			Status: "ok",
-			Data:   make(map[string]output),
+			Data:   make(map[string]*storeEntry),
 		}
 		if _, ok := app.store.data[group]; ok {
 			for k := range app.store.data[group] {
-				length := len(app.store.data[group][k][agg].counters)
-				r.Data[k] = output{
-					Values:   make([]*int, length),
-					Counters: make([]int, length),
-				}
-				copy(r.Data[k].Counters, app.store.data[group][k][agg].counters)
-				for i := 0; i < length; i++ {
-					if r.Data[k].Counters[i] > 0 {
-						r.Data[k].Values[i] = new(int)
-						*r.Data[k].Values[i] = app.store.data[group][k][agg].values[i]
-					}
-				}
+				r.Data[k] = app.store.data[group][k][agg]
 			}
 		}
-		if body, err := json.Marshal(r); err != nil {
+		if err = json.NewEncoder(w).Encode(r); err != nil {
 			message = "cannot build response"
-		} else {
-			w.Write(body)
-			return
+			logger.ERROR("GET", fmt.Sprintf("%s (%s)", message, req.RemoteAddr))
 		}
+	} else {
+		message = "invalid request"
+		logger.WARNING("GET", fmt.Sprintf("%s (%s)", message, req.RemoteAddr))
+		fmt.Fprint(w, `{"status": "error", "data": {}}`)
 	}
-
-	logger.WARNING("GET", fmt.Sprintf("%s (%s)", message, req.RemoteAddr))
-	io.WriteString(w, `{"status": "error", "data": {}}`)
 
 }
 
@@ -241,27 +223,27 @@ func (app *application) processData() {
 							store[v.Group][v.Key] = make(map[int]*storeEntry)
 							for i := 0; i < aggsLength; i++ {
 								store[v.Group][v.Key][aggs[i]] = &storeEntry{
-									values:   make([]int, len(v.Values)),
-									counters: make([]int, len(v.Values)),
+									Values:   make([]int, len(v.Values)),
+									Counters: make([]int, len(v.Values)),
 								}
 							}
 						} else if _, ok := store[v.Group][v.Key]; !ok {
 							store[v.Group][v.Key] = make(map[int]*storeEntry)
 							for i := 0; i < aggsLength; i++ {
 								store[v.Group][v.Key][aggs[i]] = &storeEntry{
-									values:   make([]int, len(v.Values)),
-									counters: make([]int, len(v.Values)),
+									Values:   make([]int, len(v.Values)),
+									Counters: make([]int, len(v.Values)),
 								}
 							}
 						}
 						for i := aggIndex; i < aggsLength; i++ {
 							for j := range v.Values {
 								if v.Values[j] != nil {
-									store[v.Group][v.Key][aggs[i]].values[j] += *v.Values[j]
-									store[v.Group][v.Key][aggs[i]].counters[j]++
+									store[v.Group][v.Key][aggs[i]].Values[j] += *v.Values[j]
+									store[v.Group][v.Key][aggs[i]].Counters[j]++
 								}
 							}
-							store[v.Group][v.Key][aggs[i]].cnt++
+							store[v.Group][v.Key][aggs[i]].Cnt++
 						}
 					}
 					for i := aggIndex; i < aggsLength; i++ {
@@ -275,7 +257,7 @@ func (app *application) processData() {
 			for bucket := range index[agg] {
 				if bucket < ts-agg {
 					for _, v := range rawData[bucket] {
-						if i == aggsLength-1 && store[v.Group][v.Key][agg].cnt == 1 {
+						if i == aggsLength-1 && store[v.Group][v.Key][agg].Cnt == 1 {
 							delete(store[v.Group], v.Key)
 							if len(store[v.Group]) == 0 {
 								delete(store, v.Group)
@@ -283,11 +265,11 @@ func (app *application) processData() {
 						} else {
 							for j := range v.Values {
 								if v.Values[j] != nil {
-									store[v.Group][v.Key][agg].values[j] -= *v.Values[j]
-									store[v.Group][v.Key][agg].counters[j]--
+									store[v.Group][v.Key][agg].Values[j] -= *v.Values[j]
+									store[v.Group][v.Key][agg].Counters[j]--
 								}
 							}
-							store[v.Group][v.Key][agg].cnt--
+							store[v.Group][v.Key][agg].Cnt--
 						}
 					}
 					delete(index[agg], bucket)
