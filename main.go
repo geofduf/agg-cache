@@ -2,7 +2,6 @@ package main
 
 import (
 	"encoding/json"
-	"errors"
 	"flag"
 	"fmt"
 	"net/http"
@@ -31,7 +30,7 @@ func (l *levels) Set(value string) error {
 	for _, level := range strings.Split(value, ",") {
 		v, err := strconv.Atoi(level)
 		if err != nil || v <= 0 {
-			return errors.New(fmt.Sprintf(`"%s" is not a positive integer`, level))
+			return fmt.Errorf(`"%s" is not a positive integer`, level)
 		}
 		if !processed[v] {
 			*l = append(*l, v)
