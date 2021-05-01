@@ -94,7 +94,7 @@ func (app *application) insertHandler(w http.ResponseWriter, req *http.Request) 
 	if err := d.Decode(&entries); err != nil {
 		status = "error"
 		message = "cannot decode request body"
-		logger.WARNING("INS", fmt.Sprintf("%s (%s)", message, req.RemoteAddr))
+		logger.Warning("INS", fmt.Sprintf("%s (%s)", message, req.RemoteAddr))
 	} else {
 		ts := int(time.Now().Unix()) / config.frequency * config.frequency
 		app.queue.Lock()
@@ -153,11 +153,11 @@ func (app *application) groupHandler(w http.ResponseWriter, req *http.Request) {
 		}
 		if err = json.NewEncoder(w).Encode(r); err != nil {
 			message = "cannot build response"
-			logger.ERROR("GET", fmt.Sprintf("%s (%s)", message, req.RemoteAddr))
+			logger.Error("GET", fmt.Sprintf("%s (%s)", message, req.RemoteAddr))
 		}
 	} else {
 		message = "invalid request"
-		logger.WARNING("GET", fmt.Sprintf("%s (%s)", message, req.RemoteAddr))
+		logger.Warning("GET", fmt.Sprintf("%s (%s)", message, req.RemoteAddr))
 		fmt.Fprint(w, `{"status": "error", "data": {}}`)
 	}
 
@@ -175,7 +175,7 @@ func (app *application) processData() {
 	}
 
 	napDuration := config.frequency - int(time.Now().Unix())%config.frequency
-	logger.SYSTEM("PRO", fmt.Sprintf("scheduler will start in %d second(s)", napDuration))
+	logger.System("PRO", fmt.Sprintf("scheduler will start in %d second(s)", napDuration))
 	time.Sleep(time.Duration(napDuration) * time.Second)
 
 	ticker := time.NewTicker(time.Duration(config.frequency) * time.Second)
@@ -185,7 +185,7 @@ func (app *application) processData() {
 		start := time.Now()
 
 		if int(start.Unix())%config.frequency > 3 {
-			logger.WARNING("PRO", "probably drifting")
+			logger.Warning("PRO", "probably drifting")
 		}
 
 		app.queue.Lock()
@@ -203,7 +203,7 @@ func (app *application) processData() {
 		store := app.store.data
 
 		if elapsed := time.Since(start); elapsed > 1000000000 {
-			logger.WARNING("PRO", fmt.Sprintf("offset of %d seconds", elapsed/1000000000))
+			logger.Warning("PRO", fmt.Sprintf("offset of %d seconds", elapsed/1000000000))
 		}
 
 		ts := int(time.Now().Unix()) / config.frequency * config.frequency
@@ -279,16 +279,16 @@ func (app *application) processData() {
 			}
 		}
 		app.store.Unlock()
-		logger.DEBUG("PRO", fmt.Sprintf("ticker: %s duration: %s", t, time.Since(start)))
+		logger.Debug("PRO", fmt.Sprintf("ticker: %s duration: %s", t, time.Since(start)))
 	}
 }
 
 func main() {
 	flag.Parse()
 	if config.frequency <= 0 {
-		logger.FATAL("INI", "frequency must be a positive integer")
+		logger.Fatal("INI", "frequency must be a positive integer")
 	} else if config.frequency > config.aggs[0] {
-		logger.FATAL("INI", "frequency must be lower or equal to the first aggregation level")
+		logger.Fatal("INI", "frequency must be lower or equal to the first aggregation level")
 	}
 	logger.SetLevel(config.logging)
 	app := application{
@@ -299,7 +299,7 @@ func main() {
 	http.HandleFunc("/group/", app.groupHandler)
 	http.HandleFunc("/insert", app.insertHandler)
 	if err := http.ListenAndServe(config.listen, nil); err != nil {
-		logger.FATAL("INI", err.Error())
+		logger.Fatal("INI", err.Error())
 	}
 }
 
