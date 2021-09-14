@@ -1,9 +1,12 @@
 package main
 
 import (
+	"bytes"
+	"encoding/binary"
 	"encoding/json"
 	"flag"
 	"fmt"
+	"math/bits"
 	"net/http"
 	"sort"
 	"strconv"
@@ -12,6 +15,13 @@ import (
 	"time"
 
 	"github.com/geofduf/logging"
+)
+
+const (
+	missingFlag byte = iota
+	regularFlag byte = iota
+	encodedFlag byte = iota
+	entryFlag   byte = iota
 )
 
 type levels []int
@@ -51,9 +61,9 @@ var config struct {
 }
 
 type input struct {
-	Group  string `json:"group"`
-	Key    string `json:"key"`
-	Values []*int `json:"values"`
+	Group  string   `json:"group"`
+	Key    string   `json:"key"`
+	Values []*int64 `json:"values"`
 }
 
 type response struct {
@@ -62,14 +72,21 @@ type response struct {
 }
 
 type storeEntry struct {
-	Values   []int `json:"values"`
-	Counters []int `json:"counters"`
-	Cnt      int   `json:"-"`
+	Values   []int64 `json:"values"`
+	Counters []int   `json:"counters"`
+	Cnt      int     `json:"-"`
+}
+
+type mapping struct {
+	forward map[string]int64
+	reverse map[int64]string
 }
 
 type mStore struct {
 	sync.RWMutex
-	data map[string]map[string]map[int]*storeEntry
+	data     map[string]map[string]map[int]*storeEntry
+	groupMap mapping
+	keyMap   mapping
 }
 
 type mQueue struct {
@@ -165,9 +182,13 @@ func (app *application) groupHandler(w http.ResponseWriter, req *http.Request) {
 
 func (app *application) processData() {
 
+	var groupCnt int64
+	var keyCnt int64
+
 	aggs := config.aggs
 	aggsLength := len(aggs)
-	rawData := make(map[int][]input)
+	rawData := make(map[int][]byte)
+	container := make([]byte, binary.MaxVarintLen64)
 
 	index := make(map[int]map[int]bool)
 	for _, agg := range aggs {
@@ -209,20 +230,47 @@ func (app *application) processData() {
 		ts := int(time.Now().Unix()) / config.frequency * config.frequency
 
 		for _, bucket := range buckets {
-			if _, ok := rawData[bucket]; ok {
-				rawData[bucket] = append(rawData[bucket], queue[bucket]...)
-			} else {
-				rawData[bucket] = queue[bucket]
-			}
 			for aggIndex := range aggs {
 				if bucket >= ts-aggs[aggIndex] {
+					buf := new(bytes.Buffer)
+					previousValue := new(int64)
 					for _, v := range queue[bucket] {
+						groupId, ok := app.store.groupMap.forward[v.Group]
+						if !ok {
+							app.store.groupMap.forward[v.Group] = groupCnt
+							app.store.groupMap.reverse[groupCnt] = v.Group
+							groupId = groupCnt
+							groupCnt += 1
+						}
+						keyId, ok := app.store.keyMap.forward[v.Key]
+						if !ok {
+							app.store.keyMap.forward[v.Key] = keyCnt
+							app.store.keyMap.reverse[keyCnt] = v.Key
+							keyId = keyCnt
+							keyCnt += 1
+						}
+						buf.WriteByte(entryFlag)
+						n := binary.PutVarint(container, groupId)
+						buf.Write(container[:n])
+						n = binary.PutVarint(container, keyId)
+						buf.Write(container[:n])
+						for i := 0; i < len(v.Values); i++ {
+							if v.Values[i] == nil {
+								buf.WriteByte(missingFlag)
+							} else {
+								flag, value := tryDeltaEncoding(v.Values[i], previousValue)
+								buf.WriteByte(flag)
+								n = binary.PutVarint(container, value)
+								buf.Write(container[:n])
+								previousValue = v.Values[i]
+							}
+						}
 						if _, ok := store[v.Group]; !ok {
 							store[v.Group] = make(map[string]map[int]*storeEntry)
 							store[v.Group][v.Key] = make(map[int]*storeEntry)
 							for i := 0; i < aggsLength; i++ {
 								store[v.Group][v.Key][aggs[i]] = &storeEntry{
-									Values:   make([]int, len(v.Values)),
+									Values:   make([]int64, len(v.Values)),
 									Counters: make([]int, len(v.Values)),
 								}
 							}
@@ -230,7 +278,7 @@ func (app *application) processData() {
 							store[v.Group][v.Key] = make(map[int]*storeEntry)
 							for i := 0; i < aggsLength; i++ {
 								store[v.Group][v.Key][aggs[i]] = &storeEntry{
-									Values:   make([]int, len(v.Values)),
+									Values:   make([]int64, len(v.Values)),
 									Counters: make([]int, len(v.Values)),
 								}
 							}
@@ -248,27 +296,64 @@ func (app *application) processData() {
 					for i := aggIndex; i < aggsLength; i++ {
 						index[aggs[i]][bucket] = true
 					}
+					rawData[bucket] = make([]byte, buf.Len())
+					copy(rawData[bucket], buf.Bytes())
 					break
 				}
 			}
 		}
+
+		var isValue, skip bool
+		var j, cnt int
+		var group, key string
+
 		for i, agg := range aggs {
 			for bucket := range index[agg] {
 				if bucket < ts-agg {
-					for _, v := range rawData[bucket] {
-						if i == aggsLength-1 && store[v.Group][v.Key][agg].Cnt == 1 {
-							delete(store[v.Group], v.Key)
-							if len(store[v.Group]) == 0 {
-								delete(store, v.Group)
+					cnt = 0
+					var previousValue int64
+					for cnt < len(rawData[bucket]) {
+						if !isValue {
+							switch rawData[bucket][cnt] {
+							case entryFlag:
+								j = 0
+								skip = false
+								cnt += 1
+								id, n := binary.Varint(rawData[bucket][cnt:])
+								group = app.store.groupMap.reverse[id]
+								cnt += n
+								id, n = binary.Varint(rawData[bucket][cnt:])
+								key = app.store.keyMap.reverse[id]
+								cnt += n
+								if i == aggsLength-1 && store[group][key][agg].Cnt == 1 {
+									delete(store[group], key)
+									if len(store[group]) == 0 {
+										delete(store, group)
+									}
+									skip = true
+								} else {
+									store[group][key][agg].Cnt--
+								}
+							case missingFlag:
+								j += 1
+								cnt += 1
+							case regularFlag, encodedFlag:
+								isValue = true
+								cnt += 1
 							}
 						} else {
-							for j := range v.Values {
-								if v.Values[j] != nil {
-									store[v.Group][v.Key][agg].Values[j] -= *v.Values[j]
-									store[v.Group][v.Key][agg].Counters[j]--
-								}
+							value, n := binary.Varint(rawData[bucket][cnt:])
+							if rawData[bucket][cnt-1] == encodedFlag {
+								value = value + previousValue
 							}
-							store[v.Group][v.Key][agg].Cnt--
+							if !skip {
+								store[group][key][agg].Values[j] -= value
+								store[group][key][agg].Counters[j]--
+							}
+							isValue = false
+							j += 1
+							cnt += n
+							previousValue = value
 						}
 					}
 					delete(index[agg], bucket)
@@ -283,6 +368,23 @@ func (app *application) processData() {
 	}
 }
 
+func tryDeltaEncoding(value *int64, previousValue *int64) (byte, int64) {
+	if x := *value; (x > 63 || x < -63) && previousValue != nil {
+		y := x - *previousValue
+		delta := y
+		if x < 0 {
+			x = -x
+		}
+		if y < 0 {
+			y = -y
+		}
+		if x > y && bits.Len64(uint64(x))/7 > bits.Len64(uint64(y))/7 {
+			return encodedFlag, delta
+		}
+	}
+	return regularFlag, *value
+}
+
 func main() {
 	flag.Parse()
 	if config.frequency <= 0 {
@@ -293,7 +395,17 @@ func main() {
 	logger.SetLevel(config.logging)
 	app := application{
 		queue: mQueue{data: make(map[int][]input)},
-		store: mStore{data: make(map[string]map[string]map[int]*storeEntry)},
+		store: mStore{
+			data: make(map[string]map[string]map[int]*storeEntry),
+			groupMap: mapping{
+				forward: make(map[string]int64),
+				reverse: make(map[int64]string),
+			},
+			keyMap: mapping{
+				forward: make(map[string]int64),
+				reverse: make(map[int64]string),
+			},
+		},
 	}
 	go app.processData()
 	http.HandleFunc("/group/", app.groupHandler)
