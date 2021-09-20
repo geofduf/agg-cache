@@ -60,6 +60,11 @@ var config struct {
 	listen    string
 }
 
+type garbageCollector struct {
+	groups map[int]struct{}
+	keys   []map[int]struct{}
+}
+
 type input struct {
 	Group  string   `json:"group"`
 	Key    string   `json:"key"`
@@ -72,21 +77,22 @@ type response struct {
 }
 
 type storeEntry struct {
-	Values   []int64 `json:"values"`
-	Counters []int   `json:"counters"`
-	Cnt      int     `json:"-"`
+	Values   []int64  `json:"values"`
+	Counters []uint32 `json:"counters"`
+	Cnt      uint32   `json:"-"`
 }
 
-type mapping struct {
-	forward map[string]int64
-	reverse map[int64]string
+type groupInfo struct {
+	name    string
+	forward map[string]int
+	reverse []string
 }
 
 type mStore struct {
 	sync.RWMutex
-	data     map[string]map[string]map[int]*storeEntry
-	groupMap mapping
-	keyMap   mapping
+	data    [][][]*storeEntry
+	forward map[string]int
+	reverse []*groupInfo
 }
 
 type mQueue struct {
@@ -144,10 +150,11 @@ func (app *application) groupHandler(w http.ResponseWriter, req *http.Request) {
 	if req.Method == http.MethodGet && len(slugs) == 3 {
 		agg, err = strconv.Atoi(param)
 		if err == nil {
-			for _, v := range config.aggs {
+			for i, v := range config.aggs {
 				if agg == v {
 					valid = true
 					group = slugs[2]
+					agg = i
 					break
 				}
 			}
@@ -163,9 +170,11 @@ func (app *application) groupHandler(w http.ResponseWriter, req *http.Request) {
 			Status: "ok",
 			Data:   make(map[string]*storeEntry),
 		}
-		if _, ok := app.store.data[group]; ok {
-			for k := range app.store.data[group] {
-				r.Data[k] = app.store.data[group][k][agg]
+		if groupId, ok := app.store.forward[group]; ok {
+			for keyId, v := range app.store.data[groupId] {
+				if v != nil {
+					r.Data[app.store.reverse[groupId].reverse[keyId]] = v[agg]
+				}
 			}
 		}
 		if err = json.NewEncoder(w).Encode(r); err != nil {
@@ -182,13 +191,12 @@ func (app *application) groupHandler(w http.ResponseWriter, req *http.Request) {
 
 func (app *application) processData() {
 
-	var groupCnt int64
-	var keyCnt int64
-
 	aggs := config.aggs
 	aggsLength := len(aggs)
 	rawData := make(map[int][]byte)
 	container := make([]byte, binary.MaxVarintLen64)
+	gc := garbageCollector{groups: make(map[int]struct{})}
+	var buf bytes.Buffer
 
 	index := make(map[int]map[int]bool)
 	for _, agg := range aggs {
@@ -221,7 +229,6 @@ func (app *application) processData() {
 		sort.Sort(sort.Reverse(sort.IntSlice(buckets)))
 
 		app.store.Lock()
-		store := app.store.data
 
 		if elapsed := time.Since(start); elapsed > 1000000000 {
 			logger.Warning("PRO", fmt.Sprintf("offset of %d seconds", elapsed/1000000000))
@@ -232,27 +239,59 @@ func (app *application) processData() {
 		for _, bucket := range buckets {
 			for aggIndex := range aggs {
 				if bucket >= ts-aggs[aggIndex] {
-					buf := new(bytes.Buffer)
-					previousValue := new(int64)
+					buf.Reset()
 					for _, v := range queue[bucket] {
-						groupId, ok := app.store.groupMap.forward[v.Group]
-						if !ok {
-							app.store.groupMap.forward[v.Group] = groupCnt
-							app.store.groupMap.reverse[groupCnt] = v.Group
-							groupId = groupCnt
-							groupCnt += 1
+						var groupId, keyId int
+						var found bool
+						previousValue := new(int64)
+						if groupId, found = app.store.forward[v.Group]; !found {
+							g := &groupInfo{
+								name:    v.Group,
+								forward: map[string]int{v.Key: 0},
+								reverse: []string{v.Key},
+							}
+							if len(gc.groups) > 0 {
+								for groupId = range gc.groups {
+									delete(gc.groups, groupId)
+									break
+								}
+								app.store.reverse[groupId] = g
+								app.store.data[groupId] = [][]*storeEntry{make([]*storeEntry, aggsLength)}
+							} else {
+								groupId = len(app.store.reverse)
+								app.store.reverse = append(app.store.reverse, g)
+								app.store.data = append(app.store.data, [][]*storeEntry{make([]*storeEntry, aggsLength)})
+								gc.keys = append(gc.keys, make(map[int]struct{}))
+							}
+							app.store.forward[v.Group] = groupId
+						} else if keyId, found = app.store.reverse[groupId].forward[v.Key]; !found {
+							g := app.store.reverse[groupId]
+							if len(gc.keys[groupId]) > 0 {
+								for keyId = range gc.keys[groupId] {
+									delete(gc.keys[groupId], keyId)
+									break
+								}
+								g.reverse[keyId] = v.Key
+								app.store.data[groupId][keyId] = make([]*storeEntry, aggsLength)
+							} else {
+								keyId = len(g.reverse)
+								g.reverse = append(g.reverse, v.Key)
+								app.store.data[groupId] = append(app.store.data[groupId], make([]*storeEntry, aggsLength))
+							}
+							g.forward[v.Key] = keyId
 						}
-						keyId, ok := app.store.keyMap.forward[v.Key]
-						if !ok {
-							app.store.keyMap.forward[v.Key] = keyCnt
-							app.store.keyMap.reverse[keyCnt] = v.Key
-							keyId = keyCnt
-							keyCnt += 1
+						if !found {
+							for i := 0; i < aggsLength; i++ {
+								app.store.data[groupId][keyId][i] = &storeEntry{
+									Values:   make([]int64, len(v.Values)),
+									Counters: make([]uint32, len(v.Values)),
+								}
+							}
 						}
 						buf.WriteByte(entryFlag)
-						n := binary.PutVarint(container, groupId)
+						n := binary.PutVarint(container, int64(groupId))
 						buf.Write(container[:n])
-						n = binary.PutVarint(container, keyId)
+						n = binary.PutVarint(container, int64(keyId))
 						buf.Write(container[:n])
 						for i := 0; i < len(v.Values); i++ {
 							if v.Values[i] == nil {
@@ -263,34 +302,14 @@ func (app *application) processData() {
 								n = binary.PutVarint(container, value)
 								buf.Write(container[:n])
 								previousValue = v.Values[i]
-							}
-						}
-						if _, ok := store[v.Group]; !ok {
-							store[v.Group] = make(map[string]map[int]*storeEntry)
-							store[v.Group][v.Key] = make(map[int]*storeEntry)
-							for i := 0; i < aggsLength; i++ {
-								store[v.Group][v.Key][aggs[i]] = &storeEntry{
-									Values:   make([]int64, len(v.Values)),
-									Counters: make([]int, len(v.Values)),
+								for j := aggIndex; j < aggsLength; j++ {
+									if i == 0 {
+										app.store.data[groupId][keyId][j].Cnt++
+									}
+									app.store.data[groupId][keyId][j].Values[i] += *v.Values[i]
+									app.store.data[groupId][keyId][j].Counters[i]++
 								}
 							}
-						} else if _, ok := store[v.Group][v.Key]; !ok {
-							store[v.Group][v.Key] = make(map[int]*storeEntry)
-							for i := 0; i < aggsLength; i++ {
-								store[v.Group][v.Key][aggs[i]] = &storeEntry{
-									Values:   make([]int64, len(v.Values)),
-									Counters: make([]int, len(v.Values)),
-								}
-							}
-						}
-						for i := aggIndex; i < aggsLength; i++ {
-							for j := range v.Values {
-								if v.Values[j] != nil {
-									store[v.Group][v.Key][aggs[i]].Values[j] += *v.Values[j]
-									store[v.Group][v.Key][aggs[i]].Counters[j]++
-								}
-							}
-							store[v.Group][v.Key][aggs[i]].Cnt++
 						}
 					}
 					for i := aggIndex; i < aggsLength; i++ {
@@ -303,15 +322,12 @@ func (app *application) processData() {
 			}
 		}
 
-		var isValue, skip bool
-		var j, cnt int
-		var group, key string
-
 		for i, agg := range aggs {
 			for bucket := range index[agg] {
 				if bucket < ts-agg {
-					cnt = 0
+					var groupId, keyId, cnt, j int
 					var previousValue int64
+					var isValue, skip bool
 					for cnt < len(rawData[bucket]) {
 						if !isValue {
 							switch rawData[bucket][cnt] {
@@ -320,19 +336,26 @@ func (app *application) processData() {
 								skip = false
 								cnt += 1
 								id, n := binary.Varint(rawData[bucket][cnt:])
-								group = app.store.groupMap.reverse[id]
+								groupId = int(id)
 								cnt += n
 								id, n = binary.Varint(rawData[bucket][cnt:])
-								key = app.store.keyMap.reverse[id]
+								keyId = int(id)
 								cnt += n
-								if i == aggsLength-1 && store[group][key][agg].Cnt == 1 {
-									delete(store[group], key)
-									if len(store[group]) == 0 {
-										delete(store, group)
+								if i == aggsLength-1 && app.store.data[groupId][keyId][i].Cnt == 1 {
+									if len(app.store.data[groupId]) == len(gc.keys[groupId])-1 {
+										gc.groups[groupId] = struct{}{}
+										gc.keys[groupId] = nil
+										app.store.data[groupId] = nil
+										delete(app.store.forward, app.store.reverse[groupId].name)
+										app.store.reverse[groupId] = nil
+									} else {
+										gc.keys[groupId][keyId] = struct{}{}
+										app.store.data[groupId][keyId] = nil
+										delete(app.store.reverse[groupId].forward, app.store.reverse[groupId].reverse[keyId])
 									}
 									skip = true
 								} else {
-									store[group][key][agg].Cnt--
+									app.store.data[groupId][keyId][i].Cnt--
 								}
 							case missingFlag:
 								j += 1
@@ -347,8 +370,8 @@ func (app *application) processData() {
 								value = value + previousValue
 							}
 							if !skip {
-								store[group][key][agg].Values[j] -= value
-								store[group][key][agg].Counters[j]--
+								app.store.data[groupId][keyId][i].Values[j] -= value
+								app.store.data[groupId][keyId][i].Counters[j]--
 							}
 							isValue = false
 							j += 1
@@ -395,17 +418,7 @@ func main() {
 	logger.SetLevel(config.logging)
 	app := application{
 		queue: mQueue{data: make(map[int][]input)},
-		store: mStore{
-			data: make(map[string]map[string]map[int]*storeEntry),
-			groupMap: mapping{
-				forward: make(map[string]int64),
-				reverse: make(map[int64]string),
-			},
-			keyMap: mapping{
-				forward: make(map[string]int64),
-				reverse: make(map[int64]string),
-			},
-		},
+		store: mStore{forward: make(map[string]int)},
 	}
 	go app.processData()
 	http.HandleFunc("/group/", app.groupHandler)
