@@ -19,17 +19,12 @@ import (
 
 const (
 	missingFlag byte = iota
-	regularFlag byte = iota
-	encodedFlag byte = iota
-	entryFlag   byte = iota
+	regularFlag
+	encodedFlag
+	entryFlag
 )
 
 var logger *logging.Logger
-
-type garbageCollector struct {
-	groups map[int]struct{}
-	keys   []map[int]struct{}
-}
 
 type input struct {
 	Group  string   `json:"group"`
@@ -42,33 +37,14 @@ type response struct {
 	Data   map[string]*storeEntry `json:"data"`
 }
 
-type storeEntry struct {
-	Values   []int64  `json:"values"`
-	Counters []uint32 `json:"counters"`
-	Cnt      uint32   `json:"-"`
-}
-
-type groupInfo struct {
-	name    string
-	forward map[string]int
-	reverse []string
-}
-
-type mStore struct {
-	sync.RWMutex
-	data    [][][]*storeEntry
-	forward map[string]int
-	reverse []*groupInfo
-}
-
-type mQueue struct {
+type queue struct {
 	sync.Mutex
 	data map[int][]input
 }
 
 type application struct {
-	store     mStore
-	queue     mQueue
+	store     store
+	queue     queue
 	aggs      []int
 	frequency int
 }
@@ -163,7 +139,6 @@ func (app *application) processData() {
 	aggsLength := len(aggs)
 	rawData := make(map[int][]byte)
 	container := make([]byte, binary.MaxVarintLen64)
-	gc := garbageCollector{groups: make(map[int]struct{})}
 	var buf bytes.Buffer
 
 	index := make(map[int]map[int]bool)
@@ -209,53 +184,8 @@ func (app *application) processData() {
 				if bucket >= ts-aggs[aggIndex] {
 					buf.Reset()
 					for _, v := range queue[bucket] {
-						var groupId, keyId int
-						var found bool
 						previousValue := new(int64)
-						if groupId, found = app.store.forward[v.Group]; !found {
-							g := &groupInfo{
-								name:    v.Group,
-								forward: map[string]int{v.Key: 0},
-								reverse: []string{v.Key},
-							}
-							if len(gc.groups) > 0 {
-								for groupId = range gc.groups {
-									delete(gc.groups, groupId)
-									break
-								}
-								app.store.reverse[groupId] = g
-								app.store.data[groupId] = [][]*storeEntry{make([]*storeEntry, aggsLength)}
-							} else {
-								groupId = len(app.store.reverse)
-								app.store.reverse = append(app.store.reverse, g)
-								app.store.data = append(app.store.data, [][]*storeEntry{make([]*storeEntry, aggsLength)})
-								gc.keys = append(gc.keys, make(map[int]struct{}))
-							}
-							app.store.forward[v.Group] = groupId
-						} else if keyId, found = app.store.reverse[groupId].forward[v.Key]; !found {
-							g := app.store.reverse[groupId]
-							if len(gc.keys[groupId]) > 0 {
-								for keyId = range gc.keys[groupId] {
-									delete(gc.keys[groupId], keyId)
-									break
-								}
-								g.reverse[keyId] = v.Key
-								app.store.data[groupId][keyId] = make([]*storeEntry, aggsLength)
-							} else {
-								keyId = len(g.reverse)
-								g.reverse = append(g.reverse, v.Key)
-								app.store.data[groupId] = append(app.store.data[groupId], make([]*storeEntry, aggsLength))
-							}
-							g.forward[v.Key] = keyId
-						}
-						if !found {
-							for i := 0; i < aggsLength; i++ {
-								app.store.data[groupId][keyId][i] = &storeEntry{
-									Values:   make([]int64, len(v.Values)),
-									Counters: make([]uint32, len(v.Values)),
-								}
-							}
-						}
+						groupId, keyId := app.store.getIdentifiers(v.Group, v.Key, aggsLength, len(v.Values))
 						buf.WriteByte(entryFlag)
 						n := binary.PutVarint(container, int64(groupId))
 						buf.Write(container[:n])
@@ -310,17 +240,7 @@ func (app *application) processData() {
 								keyId = int(id)
 								cnt += n
 								if i == aggsLength-1 && app.store.data[groupId][keyId][i].Cnt == 1 {
-									if len(app.store.data[groupId]) == len(gc.keys[groupId])-1 {
-										gc.groups[groupId] = struct{}{}
-										gc.keys[groupId] = nil
-										app.store.data[groupId] = nil
-										delete(app.store.forward, app.store.reverse[groupId].name)
-										app.store.reverse[groupId] = nil
-									} else {
-										gc.keys[groupId][keyId] = struct{}{}
-										app.store.data[groupId][keyId] = nil
-										delete(app.store.reverse[groupId].forward, app.store.reverse[groupId].reverse[keyId])
-									}
+									app.store.releaseKey(groupId, keyId)
 									skip = true
 								} else {
 									app.store.data[groupId][keyId][i].Cnt--
@@ -355,7 +275,7 @@ func (app *application) processData() {
 			}
 		}
 		app.store.Unlock()
-		logger.Debug("PRO", fmt.Sprintf("ticker: %s duration: %s", t, time.Since(start)))
+		logger.Debug("PRO", fmt.Sprintf("ticker: %s duration: %s store: %v", t, time.Since(start), app.store.statistics))
 	}
 }
 
@@ -384,8 +304,8 @@ func NewCache(frequency int, aggs []int) (app *application, err error) {
 		err = errors.New("frequency must be lower or equal to the first aggregation level")
 	} else {
 		app = &application{
-			queue:     mQueue{data: make(map[int][]input)},
-			store:     mStore{forward: make(map[string]int)},
+			queue:     queue{data: make(map[int][]input)},
+			store:     store{forward: make(map[string]int), recycler: make(map[int]struct{})},
 			aggs:      aggs,
 			frequency: frequency,
 		}
