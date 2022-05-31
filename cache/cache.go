@@ -213,6 +213,9 @@ func (app *application) processData() {
 					for i := aggIndex; i < aggsLength; i++ {
 						index[aggs[i]][bucket] = true
 					}
+					if _, ok := rawData[bucket]; ok {
+						buf.Write(rawData[bucket])
+					}
 					rawData[bucket] = make([]byte, buf.Len())
 					copy(rawData[bucket], buf.Bytes())
 					break
