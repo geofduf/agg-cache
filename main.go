@@ -21,8 +21,8 @@ func (l levels) String() string {
 	return strings.Join(s, ",")
 }
 
-func (l levels) Set(value string) error {
-	l = nil
+func (l *levels) Set(value string) error {
+	*l = nil
 	processed := make(map[int]bool)
 	for _, level := range strings.Split(value, ",") {
 		v, err := strconv.Atoi(level)
@@ -30,7 +30,7 @@ func (l levels) Set(value string) error {
 			return fmt.Errorf(`"%s" is not a positive integer`, level)
 		}
 		if !processed[v] {
-			l = append(l, v)
+			*l = append(*l, v)
 			processed[v] = true
 		}
 	}
