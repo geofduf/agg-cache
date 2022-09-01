@@ -34,7 +34,7 @@ type store struct {
 	statistics statistics
 }
 
-func (s *store) getIdentifiers(group string, key string, length int, numberOfValues int) (int, int) {
+func (s *store) getIdentifiers(group string, key string, length int, numberOfValues int, logger loggerWrapper) (int, int) {
 
 	if gid, found := s.forward[group]; !found {
 
@@ -58,8 +58,8 @@ func (s *store) getIdentifiers(group string, key string, length int, numberOfVal
 
 			s.statistics.emptyGroups -= 1
 
-			logger.Debug("STR", fmt.Sprintf("recycling group %d", gid))
-			logger.Debug("STR", fmt.Sprintf("creating key 0 for group %d (%d)", gid, len(g.recycler)))
+			logger.dispatch(logLevelDebug, "STR", fmt.Sprintf("recycling group %d", gid))
+			logger.dispatch(logLevelDebug, "STR", fmt.Sprintf("creating key 0 for group %d (%d)", gid, len(g.recycler)))
 
 		} else {
 
@@ -68,8 +68,8 @@ func (s *store) getIdentifiers(group string, key string, length int, numberOfVal
 			s.reverse = append(s.reverse, g)
 			s.data = append(s.data, [][]*storeEntry{make([]*storeEntry, length)})
 
-			logger.Debug("STR", fmt.Sprintf("creating group %d", gid))
-			logger.Debug("STR", fmt.Sprintf("creating key 0 for group %d (%d)", gid, len(g.recycler)))
+			logger.dispatch(logLevelDebug, "STR", fmt.Sprintf("creating group %d", gid))
+			logger.dispatch(logLevelDebug, "STR", fmt.Sprintf("creating key 0 for group %d (%d)", gid, len(g.recycler)))
 
 		}
 
@@ -104,7 +104,7 @@ func (s *store) getIdentifiers(group string, key string, length int, numberOfVal
 
 			s.statistics.emptyKeys -= 1
 
-			logger.Debug("STR", fmt.Sprintf("recycling key %d for group %d (%d)", kid, gid, len(g.recycler)))
+			logger.dispatch(logLevelDebug, "STR", fmt.Sprintf("recycling key %d for group %d (%d)", kid, gid, len(g.recycler)))
 
 		} else {
 
@@ -113,7 +113,7 @@ func (s *store) getIdentifiers(group string, key string, length int, numberOfVal
 			g.reverse = append(g.reverse, key)
 			s.data[gid] = append(s.data[gid], make([]*storeEntry, length))
 
-			logger.Debug("STR", fmt.Sprintf("creating key %d for group %d (%d)", kid, gid, len(g.recycler)))
+			logger.dispatch(logLevelDebug, "STR", fmt.Sprintf("creating key %d for group %d (%d)", kid, gid, len(g.recycler)))
 
 		}
 
@@ -138,7 +138,7 @@ func (s *store) getIdentifiers(group string, key string, length int, numberOfVal
 
 }
 
-func (s *store) releaseKey(gid int, kid int) {
+func (s *store) releaseKey(gid int, kid int, logger loggerWrapper) {
 
 	if len(s.reverse[gid].forward) == 1 {
 
@@ -151,7 +151,7 @@ func (s *store) releaseKey(gid int, kid int) {
 		s.statistics.keys -= 1
 		s.statistics.emptyGroups += 1
 
-		logger.Debug("STR", fmt.Sprintf("releasing group %d", gid))
+		logger.dispatch(logLevelDebug, "STR", fmt.Sprintf("releasing group %d", gid))
 
 	} else {
 
@@ -162,7 +162,7 @@ func (s *store) releaseKey(gid int, kid int) {
 		s.statistics.keys -= 1
 		s.statistics.emptyKeys += 1
 
-		logger.Debug("STR", fmt.Sprintf("releasing key %d for group %d (%d)", kid, gid, len(s.reverse[gid].recycler)))
+		logger.dispatch(logLevelDebug, "STR", fmt.Sprintf("releasing key %d for group %d (%d)", kid, gid, len(s.reverse[gid].recycler)))
 
 	}
 

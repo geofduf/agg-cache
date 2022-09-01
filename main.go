@@ -4,6 +4,7 @@ import (
 	"flag"
 	"fmt"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 
@@ -50,12 +51,13 @@ func main() {
 	flag.Var(&aggs, "levels", "Comma-separated list of aggregation levels in seconds")
 	flag.Parse()
 
-	logger := logging.GetLogger()
+	logger := logging.New()
 	logger.SetLevel(logLevel)
 
-	c, err := cache.NewCache(frequency, aggs)
+	c, err := cache.NewCache(frequency, aggs, logger)
 	if err != nil {
 		logger.Fatal("INI", err.Error())
+		os.Exit(1)
 	}
 
 	http.HandleFunc("/group/", c.GroupHandler)
@@ -63,6 +65,7 @@ func main() {
 
 	if err := http.ListenAndServe(listen, nil); err != nil {
 		logger.Fatal("INI", err.Error())
+		os.Exit(1)
 	}
 
 }

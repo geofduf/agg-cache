@@ -13,8 +13,6 @@ import (
 	"strings"
 	"sync"
 	"time"
-
-	"github.com/geofduf/logging"
 )
 
 const (
@@ -23,8 +21,6 @@ const (
 	encodedFlag
 	entryFlag
 )
-
-var logger *logging.Logger
 
 type input struct {
 	Group  string   `json:"group"`
@@ -47,6 +43,7 @@ type application struct {
 	queue     queue
 	aggs      []int
 	frequency int
+	logger    loggerWrapper
 }
 
 func (app *application) InsertHandler(w http.ResponseWriter, req *http.Request) {
@@ -61,7 +58,7 @@ func (app *application) InsertHandler(w http.ResponseWriter, req *http.Request) 
 	if err := d.Decode(&entries); err != nil {
 		status = "error"
 		message = "cannot decode request body"
-		logger.Warning("INS", fmt.Sprintf("%s (%s)", message, req.RemoteAddr))
+		app.logger.dispatch(logLevelWarning, "INS", fmt.Sprintf("%s (%s)", message, req.RemoteAddr))
 	} else {
 		ts := int(time.Now().Unix()) / app.frequency * app.frequency
 		app.queue.Lock()
@@ -123,11 +120,11 @@ func (app *application) GroupHandler(w http.ResponseWriter, req *http.Request) {
 		}
 		if err = json.NewEncoder(w).Encode(r); err != nil {
 			message = "cannot build response"
-			logger.Error("GET", fmt.Sprintf("%s (%s)", message, req.RemoteAddr))
+			app.logger.dispatch(logLevelError, "GET", fmt.Sprintf("%s (%s)", message, req.RemoteAddr))
 		}
 	} else {
 		message = "invalid request"
-		logger.Warning("GET", fmt.Sprintf("%s (%s)", message, req.RemoteAddr))
+		app.logger.dispatch(logLevelWarning, "GET", fmt.Sprintf("%s (%s)", message, req.RemoteAddr))
 		fmt.Fprint(w, `{"status": "error", "data": {}}`)
 	}
 
@@ -147,7 +144,7 @@ func (app *application) processData() {
 	}
 
 	napDuration := app.frequency - int(time.Now().Unix())%app.frequency
-	logger.System("PRO", fmt.Sprintf("scheduler will start in %d second(s)", napDuration))
+	app.logger.dispatch(logLevelSystem, "PRO", fmt.Sprintf("scheduler will start in %d second(s)", napDuration))
 	time.Sleep(time.Duration(napDuration) * time.Second)
 
 	ticker := time.NewTicker(time.Duration(app.frequency) * time.Second)
@@ -157,7 +154,7 @@ func (app *application) processData() {
 		start := time.Now()
 
 		if int(start.Unix())%app.frequency > 3 {
-			logger.Warning("PRO", "probably drifting")
+			app.logger.dispatch(logLevelWarning, "PRO", "probably drifting")
 		}
 
 		app.queue.Lock()
@@ -174,7 +171,7 @@ func (app *application) processData() {
 		app.store.Lock()
 
 		if elapsed := time.Since(start); elapsed > 1000000000 {
-			logger.Warning("PRO", fmt.Sprintf("offset of %d seconds", elapsed/1000000000))
+			app.logger.dispatch(logLevelWarning, "PRO", fmt.Sprintf("offset of %d seconds", elapsed/1000000000))
 		}
 
 		ts := int(time.Now().Unix()) / app.frequency * app.frequency
@@ -185,7 +182,7 @@ func (app *application) processData() {
 					buf.Reset()
 					for _, v := range queue[bucket] {
 						previousValue := new(int64)
-						groupId, keyId := app.store.getIdentifiers(v.Group, v.Key, aggsLength, len(v.Values))
+						groupId, keyId := app.store.getIdentifiers(v.Group, v.Key, aggsLength, len(v.Values), app.logger)
 						buf.WriteByte(entryFlag)
 						n := binary.PutVarint(container, int64(groupId))
 						buf.Write(container[:n])
@@ -243,7 +240,7 @@ func (app *application) processData() {
 								keyId = int(id)
 								cnt += n
 								if i == aggsLength-1 && app.store.data[groupId][keyId][i].Cnt == 1 {
-									app.store.releaseKey(groupId, keyId)
+									app.store.releaseKey(groupId, keyId, app.logger)
 									skip = true
 								} else {
 									app.store.data[groupId][keyId][i].Cnt--
@@ -278,7 +275,7 @@ func (app *application) processData() {
 			}
 		}
 		app.store.Unlock()
-		logger.Debug("PRO", fmt.Sprintf("ticker: %s duration: %s store: %v", t, time.Since(start), app.store.statistics))
+		app.logger.dispatch(logLevelDebug, "PRO", fmt.Sprintf("ticker: %s duration: %s store: %v", t, time.Since(start), app.store.statistics))
 	}
 }
 
@@ -299,7 +296,7 @@ func tryDeltaEncoding(value *int64, previousValue *int64) (byte, int64) {
 	return regularFlag, *value
 }
 
-func NewCache(frequency int, aggs []int) (app *application, err error) {
+func NewCache(frequency int, aggs []int, logger logger) (app *application, err error) {
 	sort.Ints(aggs)
 	if frequency <= 0 {
 		err = errors.New("frequency must be a positive integer")
@@ -311,12 +308,9 @@ func NewCache(frequency int, aggs []int) (app *application, err error) {
 			store:     store{forward: make(map[string]int), recycler: make(map[int]struct{})},
 			aggs:      aggs,
 			frequency: frequency,
+			logger:    loggerWrapper{logger},
 		}
 		go app.processData()
 	}
 	return
-}
-
-func init() {
-	logger = logging.GetLogger()
 }
