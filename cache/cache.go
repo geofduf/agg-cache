@@ -6,11 +6,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"math/bits"
 	"net/http"
 	"sort"
 	"strconv"
-	"strings"
 	"sync"
 	"time"
 
@@ -30,11 +30,6 @@ type input struct {
 	Group  string   `json:"group"`
 	Key    string   `json:"key"`
 	Values []*int64 `json:"values"`
-}
-
-type response struct {
-	Status string                 `json:"status"`
-	Data   map[string]*storeEntry `json:"data"`
 }
 
 type queue struct {
@@ -80,56 +75,46 @@ func (app *application) InsertHandler(w http.ResponseWriter, req *http.Request) 
 
 func (app *application) GroupHandler(w http.ResponseWriter, req *http.Request) {
 
-	var (
-		group   string
-		agg     int
-		err     error
-		message string
-	)
+	if req.Method != http.MethodGet {
+		w.Header().Set("Allow", "Get")
+		http.Error(w, "", 405)
+		return
+	}
 
-	param := req.FormValue("aggregation")
-	slugs := strings.Split(req.URL.Path, "/")
 	valid := false
-
-	if req.Method == http.MethodGet && len(slugs) == 3 {
-		agg, err = strconv.Atoi(param)
-		if err == nil {
-			for i, v := range app.aggs {
-				if agg == v {
-					valid = true
-					group = slugs[2]
-					agg = i
-					break
-				}
+	agg, err := strconv.Atoi(req.FormValue("agg"))
+	if err == nil {
+		for i, v := range app.aggs {
+			if agg == v {
+				valid = true
+				agg = i
+				break
 			}
 		}
+	}
+
+	if !valid {
+		http.Error(w, "", 400)
+		return
 	}
 
 	w.Header().Set("Content-Type", "application/json")
 
-	if valid {
-		app.store.RLock()
-		defer app.store.RUnlock()
-		r := response{
-			Status: "ok",
-			Data:   make(map[string]*storeEntry),
-		}
-		if groupId, ok := app.store.forward[group]; ok {
-			for keyId, v := range app.store.data[groupId] {
-				if v != nil {
-					r.Data[app.store.reverse[groupId].reverse[keyId]] = v[agg]
-				}
+	group := req.FormValue("group")
+
+	app.store.RLock()
+	if groupId, ok := app.store.forward[group]; ok {
+		s := &serializer{rows: make([]row, 0, len(app.store.data[groupId]))}
+		for keyId, v := range app.store.data[groupId] {
+			if v != nil {
+				s.add(app.store.reverse[groupId].reverse[keyId], v[agg])
 			}
 		}
-		if err = json.NewEncoder(w).Encode(r); err != nil {
-			message = "cannot build response"
-			logger.Error("GET", fmt.Sprintf("%s (%s)", message, req.RemoteAddr))
-		}
+		w.Write(s.render())
 	} else {
-		message = "invalid request"
-		logger.Warning("GET", fmt.Sprintf("%s (%s)", message, req.RemoteAddr))
-		fmt.Fprint(w, `{"status": "error", "data": {}}`)
+		io.WriteString(w, responseEmpty)
 	}
+	app.store.RUnlock()
 
 }
 
