@@ -186,13 +186,13 @@ func (app *application) processData() {
 								buf.Write(container[:n])
 								previousValue = v.Values[i]
 								for j := aggIndex; j < aggsLength; j++ {
-									if i == 0 {
-										app.store.data[groupId][keyId][j].Cnt++
-									}
 									app.store.data[groupId][keyId][j].Values[i] += *v.Values[i]
 									app.store.data[groupId][keyId][j].Counters[i]++
 								}
 							}
+						}
+						for i := aggIndex; i < aggsLength; i++ {
+							app.store.data[groupId][keyId][i].Cnt++
 						}
 					}
 					for i := aggIndex; i < aggsLength; i++ {
