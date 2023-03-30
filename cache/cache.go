@@ -180,7 +180,7 @@ func (c *cache) processData() {
 							if v.Values[i] == nil {
 								buf.WriteByte(missingFlag)
 							} else {
-								flag, value := tryDeltaEncoding(v.Values[i], previousValue)
+								flag, value := encode(v.Values[i], previousValue)
 								buf.WriteByte(flag)
 								n = binary.PutVarint(container, value)
 								buf.Write(container[:n])
@@ -267,7 +267,7 @@ func (c *cache) processData() {
 	}
 }
 
-func tryDeltaEncoding(value *int64, previousValue *int64) (byte, int64) {
+func encode(value *int64, previousValue *int64) (byte, int64) {
 	if x := *value; (x > 63 || x < -63) && previousValue != nil {
 		y := x - *previousValue
 		delta := y
