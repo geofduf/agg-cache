@@ -39,6 +39,24 @@ type cache struct {
 	frequency int
 }
 
+func New(frequency int, aggs []int) (*cache, error) {
+	sort.Ints(aggs)
+	if frequency <= 0 {
+		return nil, errors.New("frequency must be a positive integer")
+	}
+	if frequency > aggs[0] {
+		return nil, errors.New("frequency must be lower or equal to the first aggregation level")
+	}
+	c := &cache{
+		queue:     queue{data: make(map[int][]input)},
+		store:     store{forward: make(map[string]int), recycler: make(map[int]struct{})},
+		aggs:      aggs,
+		frequency: frequency,
+	}
+	go c.processData()
+	return c, nil
+}
+
 func (c *cache) processData() {
 
 	aggs := c.aggs
@@ -186,24 +204,6 @@ func (c *cache) processData() {
 		c.store.Unlock()
 		logger.Debug("PRO", fmt.Sprintf("ticker: %s duration: %s store: %v", t, time.Since(start), c.store.statistics))
 	}
-}
-
-func New(frequency int, aggs []int) (*cache, error) {
-	sort.Ints(aggs)
-	if frequency <= 0 {
-		return nil, errors.New("frequency must be a positive integer")
-	}
-	if frequency > aggs[0] {
-		return nil, errors.New("frequency must be lower or equal to the first aggregation level")
-	}
-	c := &cache{
-		queue:     queue{data: make(map[int][]input)},
-		store:     store{forward: make(map[string]int), recycler: make(map[int]struct{})},
-		aggs:      aggs,
-		frequency: frequency,
-	}
-	go c.processData()
-	return c, nil
 }
 
 func init() {
