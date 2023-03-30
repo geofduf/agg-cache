@@ -37,14 +37,14 @@ type queue struct {
 	data map[int][]input
 }
 
-type application struct {
+type cache struct {
 	store     store
 	queue     queue
 	aggs      []int
 	frequency int
 }
 
-func (app *application) InsertHandler(w http.ResponseWriter, req *http.Request) {
+func (c *cache) InsertHandler(w http.ResponseWriter, req *http.Request) {
 
 	var (
 		entries []input
@@ -58,14 +58,14 @@ func (app *application) InsertHandler(w http.ResponseWriter, req *http.Request) 
 		message = "cannot decode request body"
 		logger.Warning("INS", fmt.Sprintf("%s (%s)", message, req.RemoteAddr))
 	} else {
-		ts := int(time.Now().Unix()) / app.frequency * app.frequency
-		app.queue.Lock()
-		if _, ok := app.queue.data[ts]; ok {
-			app.queue.data[ts] = append(app.queue.data[ts], entries...)
+		ts := int(time.Now().Unix()) / c.frequency * c.frequency
+		c.queue.Lock()
+		if _, ok := c.queue.data[ts]; ok {
+			c.queue.data[ts] = append(c.queue.data[ts], entries...)
 		} else {
-			app.queue.data[ts] = entries
+			c.queue.data[ts] = entries
 		}
-		app.queue.Unlock()
+		c.queue.Unlock()
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -73,7 +73,7 @@ func (app *application) InsertHandler(w http.ResponseWriter, req *http.Request) 
 
 }
 
-func (app *application) GroupHandler(w http.ResponseWriter, req *http.Request) {
+func (c *cache) GroupHandler(w http.ResponseWriter, req *http.Request) {
 
 	if req.Method != http.MethodGet {
 		w.Header().Set("Allow", "Get")
@@ -84,7 +84,7 @@ func (app *application) GroupHandler(w http.ResponseWriter, req *http.Request) {
 	valid := false
 	agg, err := strconv.Atoi(req.FormValue("agg"))
 	if err == nil {
-		for i, v := range app.aggs {
+		for i, v := range c.aggs {
 			if agg == v {
 				valid = true
 				agg = i
@@ -102,25 +102,25 @@ func (app *application) GroupHandler(w http.ResponseWriter, req *http.Request) {
 
 	group := req.FormValue("group")
 
-	app.store.RLock()
-	if groupId, ok := app.store.forward[group]; ok {
-		s := &serializer{rows: make([]row, 0, len(app.store.data[groupId]))}
-		for keyId, v := range app.store.data[groupId] {
+	c.store.RLock()
+	if groupId, ok := c.store.forward[group]; ok {
+		s := &serializer{rows: make([]row, 0, len(c.store.data[groupId]))}
+		for keyId, v := range c.store.data[groupId] {
 			if v != nil {
-				s.add(app.store.reverse[groupId].reverse[keyId], v[agg])
+				s.add(c.store.reverse[groupId].reverse[keyId], v[agg])
 			}
 		}
 		w.Write(s.render())
 	} else {
 		io.WriteString(w, responseEmpty)
 	}
-	app.store.RUnlock()
+	c.store.RUnlock()
 
 }
 
-func (app *application) processData() {
+func (c *cache) processData() {
 
-	aggs := app.aggs
+	aggs := c.aggs
 	aggsLength := len(aggs)
 	rawData := make(map[int][]byte)
 	container := make([]byte, binary.MaxVarintLen64)
@@ -131,24 +131,24 @@ func (app *application) processData() {
 		index[agg] = make(map[int]bool)
 	}
 
-	napDuration := app.frequency - int(time.Now().Unix())%app.frequency
+	napDuration := c.frequency - int(time.Now().Unix())%c.frequency
 	logger.System("PRO", fmt.Sprintf("scheduler will start in %d second(s)", napDuration))
 	time.Sleep(time.Duration(napDuration) * time.Second)
 
-	ticker := time.NewTicker(time.Duration(app.frequency) * time.Second)
+	ticker := time.NewTicker(time.Duration(c.frequency) * time.Second)
 
 	for {
 		t := <-ticker.C
 		start := time.Now()
 
-		if int(start.Unix())%app.frequency > 3 {
+		if int(start.Unix())%c.frequency > 3 {
 			logger.Warning("PRO", "probably drifting")
 		}
 
-		app.queue.Lock()
-		queue := app.queue.data
-		app.queue.data = make(map[int][]input)
-		app.queue.Unlock()
+		c.queue.Lock()
+		queue := c.queue.data
+		c.queue.data = make(map[int][]input)
+		c.queue.Unlock()
 
 		buckets := make([]int, 0, len(queue))
 		for k := range queue {
@@ -156,13 +156,13 @@ func (app *application) processData() {
 		}
 		sort.Sort(sort.Reverse(sort.IntSlice(buckets)))
 
-		app.store.Lock()
+		c.store.Lock()
 
 		if elapsed := time.Since(start); elapsed > 1000000000 {
 			logger.Warning("PRO", fmt.Sprintf("offset of %d seconds", elapsed/1000000000))
 		}
 
-		ts := int(time.Now().Unix()) / app.frequency * app.frequency
+		ts := int(time.Now().Unix()) / c.frequency * c.frequency
 
 		for _, bucket := range buckets {
 			for aggIndex := range aggs {
@@ -170,7 +170,7 @@ func (app *application) processData() {
 					buf.Reset()
 					for _, v := range queue[bucket] {
 						previousValue := new(int64)
-						groupId, keyId := app.store.getIdentifiers(v.Group, v.Key, aggsLength, len(v.Values))
+						groupId, keyId := c.store.getIdentifiers(v.Group, v.Key, aggsLength, len(v.Values))
 						buf.WriteByte(entryFlag)
 						n := binary.PutVarint(container, int64(groupId))
 						buf.Write(container[:n])
@@ -186,13 +186,13 @@ func (app *application) processData() {
 								buf.Write(container[:n])
 								previousValue = v.Values[i]
 								for j := aggIndex; j < aggsLength; j++ {
-									app.store.data[groupId][keyId][j].Values[i] += *v.Values[i]
-									app.store.data[groupId][keyId][j].Counters[i]++
+									c.store.data[groupId][keyId][j].Values[i] += *v.Values[i]
+									c.store.data[groupId][keyId][j].Counters[i]++
 								}
 							}
 						}
 						for i := aggIndex; i < aggsLength; i++ {
-							app.store.data[groupId][keyId][i].Cnt++
+							c.store.data[groupId][keyId][i].Cnt++
 						}
 					}
 					for i := aggIndex; i < aggsLength; i++ {
@@ -227,11 +227,11 @@ func (app *application) processData() {
 								id, n = binary.Varint(rawData[bucket][cnt:])
 								keyId = int(id)
 								cnt += n
-								if i == aggsLength-1 && app.store.data[groupId][keyId][i].Cnt == 1 {
-									app.store.releaseKey(groupId, keyId)
+								if i == aggsLength-1 && c.store.data[groupId][keyId][i].Cnt == 1 {
+									c.store.releaseKey(groupId, keyId)
 									skip = true
 								} else {
-									app.store.data[groupId][keyId][i].Cnt--
+									c.store.data[groupId][keyId][i].Cnt--
 								}
 							case missingFlag:
 								j += 1
@@ -246,8 +246,8 @@ func (app *application) processData() {
 								value = value + previousValue
 							}
 							if !skip {
-								app.store.data[groupId][keyId][i].Values[j] -= value
-								app.store.data[groupId][keyId][i].Counters[j]--
+								c.store.data[groupId][keyId][i].Values[j] -= value
+								c.store.data[groupId][keyId][i].Counters[j]--
 							}
 							isValue = false
 							j += 1
@@ -262,8 +262,8 @@ func (app *application) processData() {
 				}
 			}
 		}
-		app.store.Unlock()
-		logger.Debug("PRO", fmt.Sprintf("ticker: %s duration: %s store: %v", t, time.Since(start), app.store.statistics))
+		c.store.Unlock()
+		logger.Debug("PRO", fmt.Sprintf("ticker: %s duration: %s store: %v", t, time.Since(start), c.store.statistics))
 	}
 }
 
@@ -284,22 +284,22 @@ func tryDeltaEncoding(value *int64, previousValue *int64) (byte, int64) {
 	return regularFlag, *value
 }
 
-func NewCache(frequency int, aggs []int) (app *application, err error) {
+func New(frequency int, aggs []int) (*cache, error) {
 	sort.Ints(aggs)
 	if frequency <= 0 {
-		err = errors.New("frequency must be a positive integer")
-	} else if frequency > aggs[0] {
-		err = errors.New("frequency must be lower or equal to the first aggregation level")
-	} else {
-		app = &application{
-			queue:     queue{data: make(map[int][]input)},
-			store:     store{forward: make(map[string]int), recycler: make(map[int]struct{})},
-			aggs:      aggs,
-			frequency: frequency,
-		}
-		go app.processData()
+		return nil, errors.New("frequency must be a positive integer")
 	}
-	return
+	if frequency > aggs[0] {
+		return nil, errors.New("frequency must be lower or equal to the first aggregation level")
+	}
+	c := &cache{
+		queue:     queue{data: make(map[int][]input)},
+		store:     store{forward: make(map[string]int), recycler: make(map[int]struct{})},
+		aggs:      aggs,
+		frequency: frequency,
+	}
+	go c.processData()
+	return c, nil
 }
 
 func init() {

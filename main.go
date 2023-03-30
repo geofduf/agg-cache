@@ -53,7 +53,7 @@ func main() {
 	logger := logging.GetLogger()
 	logger.SetLevel(logLevel)
 
-	c, err := cache.NewCache(frequency, aggs)
+	c, err := cache.New(frequency, aggs)
 	if err != nil {
 		logger.Fatal("INI", err.Error())
 	}
